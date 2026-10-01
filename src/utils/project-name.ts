@@ -7,6 +7,7 @@ import { CLAUDE_CONFIG_DIR, USER_SETTINGS_PATH } from '../shared/paths.js';
 import { SettingsDefaultsManager, type SettingsDefaults } from '../shared/SettingsDefaultsManager.js';
 import { logger } from './logger.js';
 import { detectWorktree, type WorktreeInfo } from './worktree.js';
+import { matchProjectEnvironment, parseProjectEnvironments, type ProjectEnvironment } from './project-environments.js';
 
 const CLAUDE_PROJECT_DIR_ENV = 'CLAUDE_PROJECT_DIR';
 const UNKNOWN_PROJECT_NAME = 'unknown-project';
@@ -164,7 +165,13 @@ function settingsFileMtimeMs(): number {
 
 function readIdentitySettings(): SettingsDefaults {
   const mtimeMs = settingsFileMtimeMs();
-  if (identitySettingsCache && mtimeMs !== -1 && identitySettingsCache.mtimeMs === mtimeMs) {
+  if (mtimeMs === -1) {
+    // No settings file yet: the defaults. Resolving a project name runs inside
+    // every hook and must never write files, and loadFromFile creates a missing
+    // settings.json (announcing it on stderr). Callers read env overrides first.
+    return SettingsDefaultsManager.getAllDefaults();
+  }
+  if (identitySettingsCache && identitySettingsCache.mtimeMs === mtimeMs) {
     return identitySettingsCache.settings;
   }
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
@@ -175,6 +182,22 @@ function readIdentitySettings(): SettingsDefaults {
 function useGitRemoteProjectNames(): boolean {
   const source = process.env[PROJECT_NAME_SOURCE_SETTING] ?? readIdentitySettings().CLAUDE_MEM_PROJECT_NAME_SOURCE;
   return String(source ?? 'path').trim().toLowerCase() === 'git-remote';
+}
+
+const PROJECT_ENVIRONMENTS_SETTING = 'CLAUDE_MEM_PROJECT_ENVIRONMENTS';
+let environmentsCache: { raw: unknown; environments: ProjectEnvironment[] } | null = null;
+
+/**
+ * Named environments (CLAUDE_MEM_PROJECT_ENVIRONMENTS, env wins), read live
+ * like the other identity settings and re-parsed only when the raw value
+ * changes, so an invalid value warns once rather than on every resolution.
+ */
+export function loadProjectEnvironments(): ProjectEnvironment[] {
+  const raw = process.env[PROJECT_ENVIRONMENTS_SETTING] ?? readIdentitySettings().CLAUDE_MEM_PROJECT_ENVIRONMENTS;
+  if (!environmentsCache || environmentsCache.raw !== raw) {
+    environmentsCache = { raw, environments: parseProjectEnvironments(raw) };
+  }
+  return environmentsCache.environments;
 }
 
 /**
@@ -204,7 +227,9 @@ export function parseOriginUrlToSlug(url: string): string | null {
   const pathPart = urlFormMatch?.[1] ?? scpFormMatch?.[1];
   if (!pathPart) return null;
 
-  const segments = pathPart.split('/').filter(Boolean);
+  // Azure DevOps puts `_git` between the project and the repository
+  // (`dev.azure.com/<org>/<project>/_git/<repo>`); it is not part of the name.
+  const segments = pathPart.split('/').filter(segment => segment && segment !== '_git');
   if (segments.length >= 2) return segments.slice(-2).join('/');
   if (segments.length === 1) return segments[0];
   return null;
@@ -252,6 +277,13 @@ export function getProjectName(
 
   const expanded = expandHome(cwd, platform);
 
+  // #2737 — an environment the user configured is an explicit declaration of
+  // identity, so it wins over every derived name.
+  const environment = matchProjectEnvironment(expanded, loadProjectEnvironments());
+  if (environment) {
+    return environment;
+  }
+
   // #2663 — inside a repo, the git root names the project so the name is stable
   // across subdirectories and worktrees (or, opt-in, the origin slug: #2827).
   // #3194 — outside one, the nearest claude-mem marker root does; otherwise the
@@ -265,6 +297,20 @@ export function getProjectName(
   return projectNameFromSource(cwd, nameSource);
 }
 
+/**
+ * How a project key was derived: from the folder (git toplevel, worktree or
+ * submodule composite, marker root, cwd), from the origin remote's slug
+ * (#2827), or from a named environment (#2737). Only a folder-derived key is
+ * tied to its checkout, so only its checkout's deletion says anything about it.
+ */
+export type ProjectKeySource = 'path' | 'git-remote' | 'environment';
+
+const PROJECT_KEY_SOURCES: readonly ProjectKeySource[] = ['path', 'git-remote', 'environment'];
+
+export function isProjectKeySource(value: unknown): value is ProjectKeySource {
+  return typeof value === 'string' && (PROJECT_KEY_SOURCES as readonly string[]).includes(value);
+}
+
 export interface ProjectContext {
   primary: string;
   parent: string | null;
@@ -272,6 +318,8 @@ export interface ProjectContext {
   /** Set when `primary` is a composite key for a submodule (#2842). */
   isSubmodule: boolean;
   allProjects: string[];
+  /** How `primary` was derived. */
+  keySource: ProjectKeySource;
 }
 
 /**
@@ -313,7 +361,7 @@ export function getProjectContext(
 ): ProjectContext {
   if (!cwd || cwd.trim() === '') {
     const fallback = getProjectName(cwd, platform);
-    return { primary: fallback, parent: null, isWorktree: false, isSubmodule: false, allProjects: [fallback] };
+    return { primary: fallback, parent: null, isWorktree: false, isSubmodule: false, allProjects: [fallback], keySource: 'path' };
   }
 
   const expandedCwd = expandHome(cwd, platform);
@@ -331,15 +379,24 @@ export function getProjectContext(
   // slug was actually derived: without one, path mode applies unchanged,
   // worktree compositing included.
   const slug = repoRoot ? gitRemoteProjectSlug(repoRoot) : null;
-  if (!slug) {
-    return pathContext;
-  }
+  const derivedContext = slug ? withPrimaryKey(pathContext, slug, 'git-remote') : pathContext;
+
+  // #2737 — a configured environment wins over every derived name, and the
+  // derived keys stay readable so memory stored before the environment existed
+  // is not hidden (`project merge` folds it in permanently).
+  const environment = matchProjectEnvironment(expandedCwd, loadProjectEnvironments());
+  return environment ? withPrimaryKey(derivedContext, environment, 'environment') : derivedContext;
+}
+
+/** Re-key a context to `primary`, keeping every key it already read as a read-only alias. */
+function withPrimaryKey(context: ProjectContext, primary: string, keySource: ProjectKeySource): ProjectContext {
   return {
-    primary: slug,
+    primary,
     parent: null,
-    isWorktree: pathContext.isWorktree,
-    isSubmodule: pathContext.isSubmodule,
-    allProjects: [...pathContext.allProjects.filter(key => key !== slug), slug],
+    isWorktree: context.isWorktree,
+    isSubmodule: context.isSubmodule,
+    allProjects: [...context.allProjects.filter(key => key !== primary), primary],
+    keySource,
   };
 }
 
@@ -388,7 +445,8 @@ function getPathProjectContext(cwd: string, expandedCwd: string, repoRoot: strin
       parent,
       isWorktree: worktreeInfo.isWorktree,
       isSubmodule: worktreeInfo.isSubmodule,
-      allProjects: [...new Set([parent, ...legacyKeys, primary])].filter(key => key !== primary).concat(primary)
+      allProjects: [...new Set([parent, ...legacyKeys, primary])].filter(key => key !== primary).concat(primary),
+      keySource: 'path',
     };
   }
 
@@ -399,9 +457,9 @@ function getPathProjectContext(cwd: string, expandedCwd: string, repoRoot: strin
   if (markerRoot && path.resolve(markerRoot) !== path.resolve(expandedCwd)) {
     const legacyKey = projectNameFromSource(cwd, expandedCwd);
     if (legacyKey !== cwdProjectName && legacyKey !== UNKNOWN_PROJECT_NAME) {
-      return { primary: cwdProjectName, parent: null, isWorktree: false, isSubmodule: false, allProjects: [legacyKey, cwdProjectName] };
+      return { primary: cwdProjectName, parent: null, isWorktree: false, isSubmodule: false, allProjects: [legacyKey, cwdProjectName], keySource: 'path' };
     }
   }
 
-  return { primary: cwdProjectName, parent: null, isWorktree: false, isSubmodule: false, allProjects: [cwdProjectName] };
+  return { primary: cwdProjectName, parent: null, isWorktree: false, isSubmodule: false, allProjects: [cwdProjectName], keySource: 'path' };
 }

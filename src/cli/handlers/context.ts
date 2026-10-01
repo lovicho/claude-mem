@@ -19,30 +19,35 @@ import { loadFromFileOnce } from '../../shared/hook-settings.js';
 import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { readStaleMarker } from '../../shared/oauth-token.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
-import { proTrialLine, proTrialUrl, PLAN_USAGE_GAIN_PERCENT } from '../../shared/pro-promo.js';
+import { proTrialLine } from '../../shared/pro-promo.js';
 import {
+  cmemGatewayRole,
   hasShownProFallbackNotice,
-  isCmemGatewayUrl,
   markProFallbackNoticeShown,
+  proFallbackNotice,
   trialDaysRemaining,
 } from '../../shared/cmem-gateway.js';
 import { resolveRuntimeContext, type ServerRuntimeContext } from '../../services/hooks/runtime-selector.js';
 import type { ContextInput } from '../../services/context/types.js';
+import { serverSessionStartBudgetMs } from '../../shared/host-hook-limits.js';
 
 // Plan-24 step 4 (#2991): in server runtime every write goes to the shared
 // server, so SessionStart reads from it too, straight from this hook process.
 // The rows go through the same renderer and 10,000-character budget as the
 // worker's /api/context/inject (#4112). No local worker is started or asked,
 // and a server that cannot answer yields an empty block (logged as
-// [server-fallback]), never stale local rows. The colored terminal render is
-// fetched concurrently, so a slow server costs one request timeout, not two.
+// [server-fallback]), never stale local rows. One read serves both the model
+// block and the colored terminal copy, and it is bounded by what the host's
+// SessionStart limit leaves (Codex kills the hook at 20 s, the client's own
+// default is 30 s).
 async function renderSessionStartFromServer(
   runtime: ServerRuntimeContext,
   contextInput: ContextInput,
   withColoredTerminalRender: boolean,
   modeId: string,
+  host: string | undefined,
 ): Promise<{ model: string; terminal: string }> {
-  const [{ generateServerContextWithStats }, { ModeManager }] = await Promise.all([
+  const [{ generateServerSessionStartContext }, { ModeManager }] = await Promise.all([
     import('../../services/context/ContextBuilder.js'),
     import('../../services/domain/ModeManager.js'),
   ]);
@@ -50,11 +55,11 @@ async function renderSessionStartFromServer(
   // so it loads the same mode itself: the renderer reads its observation types,
   // emojis and legend.
   ModeManager.getInstance().loadMode(modeId);
-  const [model, colored] = await Promise.all([
-    generateServerContextWithStats(runtime, contextInput, false),
-    withColoredTerminalRender ? generateServerContextWithStats(runtime, contextInput, true) : null,
-  ]);
-  return { model: model.text, terminal: colored ? colored.text : model.text };
+  const { model, terminal } = await generateServerSessionStartContext(runtime, contextInput, {
+    withTerminalRender: withColoredTerminalRender,
+    timeoutMs: serverSessionStartBudgetMs(host),
+  });
+  return { model, terminal: terminal ?? model };
 }
 
 export const contextHandler: EventHandler = {
@@ -116,6 +121,7 @@ export const contextHandler: EventHandler = {
           },
           showTerminalOutput && input.platform === 'claude-code',
           settings.CLAUDE_MEM_MODE,
+          input.platform,
         )
       : null;
 
@@ -149,7 +155,11 @@ export const contextHandler: EventHandler = {
     // a previous worker spawn detected an expired keychain entry.
     const staleReason = readStaleMarker();
     if (staleReason) {
-      const hint = `[claude-mem] Claude Desktop OAuth token is stale: ${staleReason}\nPlease re-login via Claude Desktop to refresh the token.`;
+      // The observer authenticates with the Claude Code CLI credentials
+      // (keychain service "Claude Code-credentials", see oauth-token.ts), not
+      // Claude Desktop. Point the remedy at the CLI so the user runs the right
+      // login (#4150).
+      const hint = `[claude-mem] Claude Code OAuth token is stale: ${staleReason}\nRun /login in Claude Code (or \`claude auth login\` in a terminal) to refresh it.`;
       additionalContext = additionalContext
         ? `${hint}\n\n${additionalContext}`
         : hint;
@@ -160,12 +170,22 @@ export const contextHandler: EventHandler = {
     // delivered key, and dispatch now runs memory on the Anthropic plan. Tell
     // the user exactly once (DATA_DIR marker file, oauth-stale pattern); the
     // marker resets whenever the fallback is cleared.
-    const fallbackActive = settings.CLAUDE_MEM_PRO_FALLBACK_AT !== ''
-      && settings.CLAUDE_MEM_PROVIDER === 'openrouter'
-      && isCmemGatewayUrl(settings.CLAUDE_MEM_OPENROUTER_BASE_URL);
+    //
+    // The gateway's own words, stored with the marker, say what happened and
+    // what to do. They enter model context, so proFallbackNotice relays them
+    // as plain bounded lines and keeps only an https cmem.ai link.
+    //
+    // The gateway as the opt-in quota fallback gets the same notice with its
+    // own consequence: dispatch skips it while it turns the account away, and
+    // without this the user would never learn why the fallback stopped.
+    const gatewayRole = cmemGatewayRole(settings);
+    const fallbackActive = settings.CLAUDE_MEM_PRO_FALLBACK_AT !== '' && gatewayRole !== null;
     if (fallbackActive && !hasShownProFallbackNotice()) {
-      const fallbackNotice = 'Your claude-mem free trial ended — memory now runs on your Anthropic plan.\n'
-        + `Keep it off-plan (up to ${PLAN_USAGE_GAIN_PERCENT}% more usage): ${proTrialUrl('fallback')}`;
+      const fallbackNotice = proFallbackNotice({
+        message: settings.CLAUDE_MEM_PRO_FALLBACK_MESSAGE,
+        action: settings.CLAUDE_MEM_PRO_FALLBACK_ACTION,
+        url: settings.CLAUDE_MEM_PRO_FALLBACK_URL,
+      }, gatewayRole);
       additionalContext = additionalContext
         ? `${fallbackNotice}\n\n${additionalContext}`
         : fallbackNotice;

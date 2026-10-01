@@ -2,7 +2,7 @@ import path from "path";
 import { randomUUID } from "crypto";
 import { readFileSync, existsSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSync, unlinkSync } from "fs";
 import { logger } from "../utils/logger.js";
-import { HOOK_TIMEOUTS, getTimeout, WEDGED_WORKER_UPTIME_DEFAULT_S, WEDGED_WORKER_UPTIME_BOUNDS_S } from "./hook-constants.js";
+import { HOOK_TIMEOUTS, defaultSessionInitRequestTimeoutMs, getTimeout, maxSessionInitRequestTimeoutMs, WEDGED_WORKER_UPTIME_DEFAULT_S, WEDGED_WORKER_UPTIME_BOUNDS_S } from "./hook-constants.js";
 import { SettingsDefaultsManager, type SettingsDefaults } from "./SettingsDefaultsManager.js";
 import { MARKETPLACE_ROOT, DATA_DIR, resolveDataDir } from "./paths.js";
 import { loadFromFileOnce } from "./hook-settings.js";
@@ -13,6 +13,7 @@ import { emitDiagnostic } from "./hook-io.js";
 import { captureCliEvent } from "../services/telemetry/cli-telemetry.js";
 import { checkVersionMatch, isPortInUse } from "../services/infrastructure/index.js";
 import { classifyPortOccupancy } from "../services/infrastructure/HealthMonitor.js";
+import { UNBINDABLE_PORT_REMEDIATION } from "./connection-errors.js";
 // Imported from ProcessManager.js directly (not the infrastructure barrel):
 // tests mock the barrel module wholesale, and the resolver must stay real.
 // ProcessManager imports nothing from worker-utils, so no cycle.
@@ -25,6 +26,7 @@ import { reclaimGhostListeningPort } from "./port-reclaim.js";
 import { sanitizeEnv } from "../supervisor/env-sanitizer.js";
 import { killProcessTree } from "./kill-process-tree.js";
 import { writeJsonFileAtomic } from "./atomic-json.js";
+import { findMissingPluginDependencies } from "./plugin-dependency-closure.js";
 
 function readTimeoutEnv(
   envName: string,
@@ -279,17 +281,23 @@ export function getWorkerApiRequestTimeoutMs(): number {
 /**
  * The UserPromptSubmit session-init budget (#3434, plan-17 step 3): one
  * deadline for the whole worker round-trip, kept inside the 15 s host timeout.
- * Never Windows-scaled — the cap it has to fit under is not scaled either.
+ * Never Windows-scaled up — the cap it has to fit under is not scaled — and
+ * on Windows both its default and its ceiling are shorter, because hook
+ * start-up there eats seconds the budget's clock never sees
+ * (defaultSessionInitRequestTimeoutMs, maxSessionInitRequestTimeoutMs).
  */
 export function getSessionInitRequestTimeoutMs(): number {
   if (cachedSessionInitRequestTimeoutMs !== null) {
     return cachedSessionInitRequestTimeoutMs;
   }
 
-  cachedSessionInitRequestTimeoutMs = readSettingsBackedTimeout(
-    'CLAUDE_MEM_SESSION_INIT_TIMEOUT_MS',
-    HOOK_TIMEOUTS.SESSION_INIT_REQUEST,
-    SESSION_INIT_REQUEST_TIMEOUT_BOUNDS
+  cachedSessionInitRequestTimeoutMs = Math.min(
+    readSettingsBackedTimeout(
+      'CLAUDE_MEM_SESSION_INIT_TIMEOUT_MS',
+      defaultSessionInitRequestTimeoutMs(),
+      SESSION_INIT_REQUEST_TIMEOUT_BOUNDS
+    ),
+    maxSessionInitRequestTimeoutMs(),
   );
   return cachedSessionInitRequestTimeoutMs;
 }
@@ -445,19 +453,41 @@ function readPackageVersion(packageJsonPath: string): string | null {
   }
 }
 
+/** Where resolveWorkerScript() looks. Injectable so tests can use temp roots. */
+export interface WorkerScriptSearchRoots {
+  cacheRoot: string;
+  marketplaceRoot: string;
+  cwd: string;
+}
+
+function defaultWorkerScriptSearchRoots(): WorkerScriptSearchRoots {
+  return {
+    cacheRoot: path.join(path.dirname(path.dirname(MARKETPLACE_ROOT)), 'cache', 'thedotmack', 'claude-mem'),
+    marketplaceRoot: MARKETPLACE_ROOT,
+    cwd: process.cwd(),
+  };
+}
+
 /**
  * Canonical worker-script resolver AND the single version oracle: the version
  * returned here is what hooks compare the live worker against
  * (checkVersionMatch) and what every spawner — hook lazy-spawn, MCP server,
- * dying-worker restart handoff — launches. Detection and respawn consulting
- * different oracles is what made the 2026-07-22 restart storm possible.
+ * dying-worker restart handoff — launches. The CLI's `start`/`stop`/`status`/
+ * `doctor` read the same answer through resolvePluginRoot(). Detection and
+ * respawn consulting different oracles is what made the 2026-07-22 restart
+ * storm possible.
  *
- * Highest version wins. Array.prototype.sort is stable, so equal versions
+ * Highest version wins among roots whose dependency closure is complete (see
+ * selectWorkerScript). Array.prototype.sort is stable, so equal versions
  * preserve the cache → marketplace → cwd precedence, and versionless
  * candidates rank behind every versioned one. The opt-in override exists for
- * local testing.
+ * local testing. $CLAUDE_PLUGIN_ROOT is deliberately not a candidate: it is
+ * set only inside host hook processes, so honoring it would give each process
+ * its own answer. The shell hooks use it only to find their own scripts.
  */
-export function resolveWorkerScript(): WorkerScriptCandidate | null {
+export function resolveWorkerScript(
+  roots: WorkerScriptSearchRoots = defaultWorkerScriptSearchRoots(),
+): WorkerScriptCandidate | null {
   const override = process.env.CLAUDE_MEM_WORKER_SCRIPT_PATH?.trim();
   if (override) {
     if (existsSync(override)) return { scriptPath: override, version: null };
@@ -465,21 +495,41 @@ export function resolveWorkerScript(): WorkerScriptCandidate | null {
   }
 
   const candidates: WorkerScriptCandidate[] = [
-    ...cacheWorkerScriptCandidates(),
+    ...cacheWorkerScriptCandidates(roots.cacheRoot),
     {
-      scriptPath: candidateWorkerScriptPath(path.join(MARKETPLACE_ROOT, 'plugin')),
-      version: readPackageVersion(path.join(MARKETPLACE_ROOT, 'package.json')),
+      scriptPath: candidateWorkerScriptPath(path.join(roots.marketplaceRoot, 'plugin')),
+      version: readPackageVersion(path.join(roots.marketplaceRoot, 'package.json')),
     },
     {
-      scriptPath: path.join(process.cwd(), 'plugin', 'scripts', 'worker-service.cjs'),
-      version: readPackageVersion(path.join(process.cwd(), 'package.json')),
+      scriptPath: path.join(roots.cwd, 'plugin', 'scripts', 'worker-service.cjs'),
+      version: readPackageVersion(path.join(roots.cwd, 'package.json')),
     },
   ];
 
   return selectWorkerScript(candidates);
 }
 
-export function selectWorkerScript(candidates: WorkerScriptCandidate[]): WorkerScriptCandidate | null {
+/** The plugin root a worker script belongs to: `<root>/scripts/worker-service.cjs`. */
+export function pluginRootOfWorkerScript(scriptPath: string): string {
+  return path.dirname(path.dirname(scriptPath));
+}
+
+function hasCompleteDependencyClosure(candidate: WorkerScriptCandidate): boolean {
+  return findMissingPluginDependencies(pluginRootOfWorkerScript(candidate.scriptPath)).length === 0;
+}
+
+/**
+ * The highest-version installed candidate whose dependency closure is complete
+ * (plan-16 step 1c). A newer root with missing modules — a marketplace copy
+ * whose node_modules was never installed, or a fresh cache extract the Setup
+ * hook has not filled yet — would spawn a worker that dies on
+ * `Cannot find module 'zod/v3'` (#3604). When no candidate is complete, the
+ * highest installed one still wins, so nothing regresses before Setup runs.
+ */
+export function selectWorkerScript(
+  candidates: WorkerScriptCandidate[],
+  isComplete: (candidate: WorkerScriptCandidate) => boolean = hasCompleteDependencyClosure,
+): WorkerScriptCandidate | null {
   const installed = candidates.filter(candidate => existsSync(candidate.scriptPath));
   if (installed.length === 0) return null;
 
@@ -489,11 +539,34 @@ export function selectWorkerScript(candidates: WorkerScriptCandidate[]): WorkerS
     if (b.version === null) return -1;
     return compareVersionsDescending(a.version, b.version);
   });
-  return installed[0];
+  return installed.find(isComplete) ?? installed[0];
 }
 
 export function resolveWorkerScriptPath(): string | null {
   return resolveWorkerScript()?.scriptPath ?? null;
+}
+
+export interface PluginRootResolution {
+  /** The directory holding scripts/worker-service.cjs. */
+  root: string;
+  version: string | null;
+  /** Declared dependencies this root's node_modules does not provide. */
+  missingDependencies: string[];
+}
+
+/**
+ * The plugin root the worker spawns from, from the same oracle as
+ * resolveWorkerScript(), with its dependency completeness. The CLI reports and
+ * spawns from this instead of assuming the marketplace copy, so a working
+ * cache-only install is never "not installed" (#3534, plan-16 steps 1 and 5).
+ */
+export function resolvePluginRoot(
+  roots: WorkerScriptSearchRoots = defaultWorkerScriptSearchRoots(),
+): PluginRootResolution | null {
+  const script = resolveWorkerScript(roots);
+  if (!script) return null;
+  const root = pluginRootOfWorkerScript(script.scriptPath);
+  return { root, version: script.version, missingDependencies: findMissingPluginDependencies(root) };
 }
 
 async function waitForWorkerPort(
@@ -892,7 +965,7 @@ export async function ensureWorkerRunning(timeoutMs?: number): Promise<boolean> 
       // A stale worker we just killed already proved its port closed
       // (waitForWorkerPortReleased); every other spawn must first prove the port
       // free (#3171).
-      if (!recycledStaleWorker && !(await preSpawnPortIsFree(preSpawnDeadline))) return false;
+      if (!recycledStaleWorker && !(await preSpawnPortIsFree(preSpawnDeadline, deadlineAt))) return false;
       const runtimePath = resolveWorkerRuntimePath();
       if (!runtimePath) {
         logger.warn('SYSTEM', 'Cannot lazy-spawn worker: Bun runtime not found (PATH, BUN / BUN_PATH / BUN_INSTALL, or ~/.bun/bin)');
@@ -913,6 +986,8 @@ export async function ensureWorkerRunning(timeoutMs?: number): Promise<boolean> 
         // rename or move long after the session ends (#3706). The helper also
         // listens for the async spawn 'error' (a dangling runtime shim), which
         // would otherwise escape as an uncaught exception (#4039).
+        // A budgeted hook caps the Windows launch (a synchronous PowerShell
+        // Start-Process) at what is left of its deadline.
         const spawned = spawnDetachedWorkerDaemon(
           runtimePath,
           scriptPath,
@@ -920,6 +995,8 @@ export async function ensureWorkerRunning(timeoutMs?: number): Promise<boolean> 
             ...process.env,
             CLAUDE_MEM_WORKER_PORT: String(getWorkerPort()),
           }),
+          process.platform,
+          remainingBudgetMs(deadlineAt) ?? undefined,
         );
         if (spawned === undefined) {
           return false;
@@ -1006,6 +1083,9 @@ const ORPHANED_PORT_REMEDIATION =
  */
 let orphanedPortDiagnosis: number | null = null;
 
+/** Port this hook process found unbindable (EACCES / EADDRNOTAVAIL), or null. Same scoping as above. */
+let unbindablePortDiagnosis: number | null = null;
+
 /**
  * The hook's pre-spawn port gate (#3171, plan-15 steps 2-3). A failed health
  * request is not proof the port is free: a wedged or orphaned listener refuses
@@ -1019,19 +1099,33 @@ let orphanedPortDiagnosis: number | null = null;
  * - indeterminate (the bind neither succeeded nor hit EADDRINUSE in time) →
  *   no spawn: never start another worker onto a port in an unknown state.
  */
-async function preSpawnPortIsFree(deadline: number): Promise<boolean> {
+async function preSpawnPortIsFree(deadline: number, hookDeadlineAt: number | null): Promise<boolean> {
   const port = getWorkerPort();
   const remainingMs = deadline - Date.now();
   if (remainingMs <= 0) return false;
 
   const occupancy = await classifyPortOccupancy(port, remainingMs);
   if (occupancy === 'free') return true;
+  if (occupancy === 'unbindable') {
+    // The OS refuses the bind itself (EACCES / EADDRNOTAVAIL): a daemon would
+    // die at listen() on every hook event. Name the fix instead of spawning.
+    unbindablePortDiagnosis = port;
+    logger.error('SYSTEM', 'Worker port cannot be bound (EACCES or EADDRNOTAVAIL) — skipping lazy-spawn', {
+      port,
+      host: getWorkerHost(),
+      fix: UNBINDABLE_PORT_REMEDIATION,
+    });
+    return false;
+  }
   if (occupancy === 'indeterminate') {
     logger.warn('SYSTEM', 'Worker port state could not be determined in time — skipping lazy-spawn', { port });
     return false;
   }
 
-  const reclaim = await reclaimGhostListeningPort(port);
+  // The reclaim gets the hook's own deadline, not the 5 s probe bound: it
+  // declines ('out-of-budget') rather than start a kill it cannot finish
+  // before the host kills the hook, and runs unbounded for callers without one.
+  const reclaim = await reclaimGhostListeningPort(port, { deadlineAt: hookDeadlineAt });
   if (reclaim.reclaimed) {
     logger.info('SYSTEM', 'Reclaimed the worker port before lazy-spawn', { port, killedPids: reclaim.killedPids });
     return true;
@@ -1089,6 +1183,8 @@ async function ensureWorkerReadyWithin(timeoutMs: number): Promise<boolean> {
           ...process.env,
           CLAUDE_MEM_WORKER_PORT: String(getWorkerPort()),
         }),
+        process.platform,
+        Math.max(1, deadline - Date.now()),
       );
       if (spawned === undefined) return false;
     }
@@ -1313,10 +1409,62 @@ export function getActiveHookType(): TelemetryHookType | null {
  * port, the port fix replaces the generic recovery hint.
  */
 function buildWorkerOutageNotice(consecutiveFailures: number): string {
-  const recovery = orphanedPortDiagnosis !== null
-    ? `Port ${orphanedPortDiagnosis} is held by an unreachable process that no PID file claims, so the worker cannot bind it. ${ORPHANED_PORT_REMEDIATION}.`
-    : 'Run `npx claude-mem restart`; if it keeps failing, run `npx claude-mem doctor`.';
+  const recovery = unbindablePortDiagnosis !== null
+    ? `The worker cannot bind port ${unbindablePortDiagnosis} on ${getWorkerHost()}: the system refuses it (EACCES or EADDRNOTAVAIL). ${UNBINDABLE_PORT_REMEDIATION}.`
+    : orphanedPortDiagnosis !== null
+      ? `Port ${orphanedPortDiagnosis} is held by an unreachable process that no PID file claims, so the worker cannot bind it. ${ORPHANED_PORT_REMEDIATION}.`
+      : 'Run `npx claude-mem restart`; if it keeps failing, run `npx claude-mem doctor`.';
   return `claude-mem worker unreachable for ${consecutiveFailures} consecutive hooks — memory features are degraded, but your prompts are not blocked. ${recovery}`;
+}
+
+export function isWorkerUnavailableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+
+  const transportPatterns = [
+    'econnrefused',
+    'econnreset',
+    'epipe',
+    'etimedout',
+    'enotfound',
+    'econnaborted',
+    'enetunreach',
+    'ehostunreach',
+    'fetch failed',
+    'unable to connect',
+    'socket hang up',
+    'socket connection was closed',
+    'connection closed',
+  ];
+  if (transportPatterns.some(p => lower.includes(p))) return true;
+
+  if (lower.includes('timed out') || lower.includes('timeout')) return true;
+
+  if (/failed:\s*5\d{2}/.test(message) || /status[:\s]+5\d{2}/.test(message)) return true;
+
+  if (/failed:\s*429/.test(message) || /status[:\s]+429/.test(message)) return true;
+
+  if (/failed:\s*4\d{2}/.test(message) || /status[:\s]+4\d{2}/.test(message)) return false;
+
+  if (error instanceof TypeError || error instanceof ReferenceError || error instanceof SyntaxError) {
+    return false;
+  }
+
+  return false;
+}
+
+let workerUnreachableScopeActive = false;
+let workerUnreachableRecordedThisProcess = false;
+
+/**
+ * Open a per-hook-process scope for recordWorkerUnreachable. hookCommand calls
+ * this at the start of each invocation so the fail-loud counter is incremented
+ * at most once per hook process, not once per worker API attempt within a
+ * composite handler. Callers outside a hook invocation are not deduplicated.
+ */
+export function resetWorkerUnreachableState(): void {
+  workerUnreachableScopeActive = true;
+  workerUnreachableRecordedThisProcess = false;
 }
 
 /**
@@ -1329,6 +1477,16 @@ function buildWorkerOutageNotice(consecutiveFailures: number): string {
  * consumeWorkerOutageNotice on the next synchronous hook.
  */
 export async function recordWorkerUnreachable(): Promise<number> {
+  // The counter tracks consecutive hook invocations (processes), not individual
+  // worker API attempts: a composite handler (e.g. Kimi's session-init-context)
+  // can hit the unreachable worker more than once in one process.
+  if (workerUnreachableScopeActive) {
+    if (workerUnreachableRecordedThisProcess) {
+      return readHookFailureState().consecutiveFailures;
+    }
+    workerUnreachableRecordedThisProcess = true;
+  }
+
   const lockToken = await acquireHookFailureLock();
   if (lockToken === null) {
     return readHookFailureState().consecutiveFailures;

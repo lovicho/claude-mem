@@ -560,6 +560,15 @@ describe('parseOriginUrlToSlug — CLAUDE_MEM_PROJECT_NAME_SOURCE=git-remote', (
     expect(parseOriginUrlToSlug('code.example.com:acme/widgets')).toBe('acme/widgets');
   });
 
+  // Gate P2-16: Azure DevOps puts `_git` between the project and the
+  // repository; it names the URL scheme, not the repository.
+  it('skips the _git segment of Azure DevOps URLs', () => {
+    expect(parseOriginUrlToSlug('https://dev.azure.com/contoso/payments/_git/api')).toBe('payments/api');
+    expect(parseOriginUrlToSlug('https://contoso@dev.azure.com/contoso/payments/_git/api')).toBe('payments/api');
+    expect(parseOriginUrlToSlug('https://contoso.visualstudio.com/DefaultCollection/payments/_git/api')).toBe('payments/api');
+    expect(parseOriginUrlToSlug('git@ssh.dev.azure.com:v3/contoso/payments/api')).toBe('payments/api');
+  });
+
   it('returns a single segment when that is all there is', () => {
     expect(parseOriginUrlToSlug('git@github.com:solorepo.git')).toBe('solorepo');
   });
@@ -652,6 +661,15 @@ describe('#2827 — git-remote project names', () => {
     expect(ctx.parent).toBeNull();
     expect(ctx.isWorktree).toBe(true);
     expect(ctx.allProjects).toEqual(['widgets-checkout', 'widgets-checkout/widgets-feature', 'acme/widgets']);
+  });
+
+  // Gate P1-2: worktree adoption only trusts a deleted checkout for a
+  // folder-derived key, so every context says how its key was derived.
+  it('reports how each key was derived', () => {
+    expect(getProjectContext(repo).keySource).toBe('git-remote');
+    expect(getProjectContext(worktree).keySource).toBe('git-remote');
+    expect(getProjectContext(noRemoteWorktree).keySource).toBe('path');
+    expect(getPathModeProjectContext(repo).keySource).toBe('path');
   });
 
   it('still exposes the folder-based identity that worktree adoption works on', () => {
